@@ -812,6 +812,70 @@ def messages_prepare(messages: list) -> str:
 KEEP_ALIVE_TIMEOUT = 5
 
 
+def detect_and_parse_tool_calls(content: str):
+    """
+    检测并解析模型返回的 tool_calls JSON
+    返回: (tool_calls_list, remaining_content)
+    """
+    import re
+    
+    # 尝试匹配 JSON 格式的 tool_calls
+    # 支持多种格式：{"tool_calls": [...]} 或直接 [...] 数组
+    tool_calls = None
+    remaining_content = content
+    
+    # 模式1: {"tool_calls": [...]}
+    pattern1 = r'\{[\s\n]*"tool_calls"[\s\n]*:[\s\n]*\[(.*?)\][\s\n]*\}'
+    match1 = re.search(pattern1, content, re.DOTALL)
+    
+    if match1:
+        try:
+            # 提取完整的 JSON 对象
+            json_str = match1.group(0)
+            parsed = json.loads(json_str)
+            if "tool_calls" in parsed and isinstance(parsed["tool_calls"], list):
+                tool_calls = parsed["tool_calls"]
+                # 移除 tool_calls JSON，保留其他内容
+                remaining_content = content[:match1.start()] + content[match1.end():]
+                remaining_content = remaining_content.strip()
+        except json.JSONDecodeError:
+            pass
+    
+    # 如果找到了 tool_calls，验证格式并返回
+    if tool_calls:
+        # 确保每个 tool_call 有必需的字段
+        valid_calls = []
+        for i, call in enumerate(tool_calls):
+            if not isinstance(call, dict):
+                continue
+            
+            # 生成 call_id（如果没有）
+            call_id = call.get("id", f"call_{i+1:03d}")
+            call_type = call.get("type", "function")
+            
+            if "function" in call:
+                func = call["function"]
+                if isinstance(func, dict) and "name" in func:
+                    # 确保 arguments 是字符串
+                    args = func.get("arguments", "{}")
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False)
+                    
+                    valid_calls.append({
+                        "id": call_id,
+                        "type": call_type,
+                        "function": {
+                            "name": func["name"],
+                            "arguments": args
+                        }
+                    })
+        
+        if valid_calls:
+            return valid_calls, remaining_content
+    
+    return None, content
+
+
 # ----------------------------------------------------------------------
 # (10) 路由：/v1/chat/completions
 # ----------------------------------------------------------------------
@@ -856,6 +920,59 @@ async def chat_completions(request: Request):
             raise HTTPException(
                 status_code=503, detail=f"Model '{model}' is not available."
             )
+        
+        # 处理 tools 参数（OpenAI 格式）
+        tools_requested = req_data.get("tools") or []
+        has_tools = len(tools_requested) > 0
+        
+        # 如果有工具定义，在 messages 前添加工具使用指导的系统消息
+        if has_tools:
+            tool_schemas = []
+            for tool in tools_requested:
+                func = tool.get('function', {})
+                tool_name = func.get('name', 'unknown')
+                tool_desc = func.get('description', 'No description available')
+                params = func.get('parameters', {})
+                
+                tool_info = f"Tool: {tool_name}\nDescription: {tool_desc}"
+                if 'properties' in params:
+                    props = []
+                    required = params.get('required', [])
+                    for prop_name, prop_info in params['properties'].items():
+                        prop_type = prop_info.get('type', 'string')
+                        prop_desc = prop_info.get('description', '')
+                        is_req = ' (required)' if prop_name in required else ''
+                        props.append(f"  - {prop_name}: {prop_type}{is_req} - {prop_desc}")
+                    if props:
+                        tool_info += f"\nParameters:\n{chr(10).join(props)}"
+                tool_schemas.append(tool_info)
+            
+            tool_system_prompt = f"""You have access to the following tools:
+
+{chr(10).join(tool_schemas)}
+
+When you need to use a tool, respond with a JSON object in this exact format:
+{{"tool_calls": [{{"id": "call_xxx", "type": "function", "function": {{"name": "tool_name", "arguments": "{{\\"param\\": \\"value\\"}}"}}}}]}}
+
+You can call multiple tools in one response by adding more objects to the tool_calls array.
+IMPORTANT: The "arguments" field must be a JSON string, not a JSON object.
+
+Example:
+{{"tool_calls": [{{"id": "call_001", "type": "function", "function": {{"name": "get_weather", "arguments": "{{\\"location\\": \\"Beijing\\"}}"}}}}]}}
+
+After calling tools, you will receive the results and can continue the conversation."""
+            
+            # 将工具说明添加到第一个 system 消息，或创建新的 system 消息
+            system_found = False
+            for msg in messages:
+                if msg.get("role") == "system":
+                    msg["content"] = msg["content"] + "\n\n" + tool_system_prompt
+                    system_found = True
+                    break
+            
+            if not system_found:
+                messages.insert(0, {"role": "system", "content": tool_system_prompt})
+        
         # 使用 messages_prepare 函数构造最终 prompt
         final_prompt = messages_prepare(messages)
         session_id = create_session(request)
@@ -1023,6 +1140,33 @@ async def chat_completions(request: Request):
                         try:
                             chunk = result_queue.get(timeout=0.05)
                             if chunk is None:
+                                # 检测 tool_calls（如果启用了 tools）
+                                tool_calls_detected = None
+                                final_text_content = final_text
+                                if has_tools:
+                                    tool_calls_detected, final_text_content = detect_and_parse_tool_calls(final_text)
+                                
+                                # 如果检测到 tool_calls，先发送 tool_calls chunk
+                                if tool_calls_detected:
+                                    for tool_call in tool_calls_detected:
+                                        tool_call_chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_time,
+                                            "model": model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "tool_calls": [tool_call]
+                                                    },
+                                                    "finish_reason": None,
+                                                }
+                                            ],
+                                        }
+                                        yield f"data: {json.dumps(tool_call_chunk, ensure_ascii=False)}\n\n"
+                                        last_send_time = current_time
+                                
                                 # 发送最终统计信息
                                 prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                                 thinking_tokens = len(final_thinking) // 4  # 简单估算token数
@@ -1035,6 +1179,10 @@ async def chat_completions(request: Request):
                                         "reasoning_tokens": thinking_tokens
                                     },
                                 }
+                                
+                                # 根据是否有 tool_calls 设置 finish_reason
+                                finish_reason = "tool_calls" if tool_calls_detected else "stop"
+                                
                                 finish_chunk = {
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
@@ -1044,7 +1192,7 @@ async def chat_completions(request: Request):
                                         {
                                             "delta": {},
                                             "index": 0,
-                                            "finish_reason": "stop",
+                                            "finish_reason": finish_reason,
                                         }
                                     ],
                                     "usage": usage,
@@ -1181,9 +1329,29 @@ async def chat_completions(request: Request):
                                                 # 构建最终结果
                                                 final_reasoning = "".join(think_list)
                                                 final_content = "".join(text_list)
+                                                
+                                                # 检测 tool_calls
+                                                tool_calls_detected = None
+                                                if has_tools:
+                                                    tool_calls_detected, final_content = detect_and_parse_tool_calls(final_content)
+                                                
                                                 prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                                                 reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
                                                 completion_tokens = len(final_content) // 4  # 简单估算token数
+                                                
+                                                # 构建 message 对象
+                                                message_obj = {
+                                                    "role": "assistant",
+                                                    "content": final_content,
+                                                    "reasoning_content": final_reasoning,
+                                                }
+                                                
+                                                # 如果检测到 tool_calls，添加到 message
+                                                finish_reason = "stop"
+                                                if tool_calls_detected:
+                                                    message_obj["tool_calls"] = tool_calls_detected
+                                                    finish_reason = "tool_calls"
+                                                
                                                 result = {
                                                     "id": completion_id,
                                                     "object": "chat.completion",
@@ -1192,12 +1360,8 @@ async def chat_completions(request: Request):
                                                     "choices": [
                                                         {
                                                             "index": 0,
-                                                            "message": {
-                                                                "role": "assistant",
-                                                                "content": final_content,
-                                                                "reasoning_content": final_reasoning,
-                                                            },
-                                                            "finish_reason": "stop",
+                                                            "message": message_obj,
+                                                            "finish_reason": finish_reason,
                                                         }
                                                     ],
                                                     "usage": {
@@ -1235,9 +1399,29 @@ async def chat_completions(request: Request):
                         # 如果没有提前构造 result，则构造默认结果
                         final_content = "".join(text_list)
                         final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
+                        
+                        # 检测 tool_calls
+                        tool_calls_detected = None
+                        if has_tools:
+                            tool_calls_detected, final_content = detect_and_parse_tool_calls(final_content)
+                        
                         prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                         reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
                         completion_tokens = len(final_content) // 4  # 简单估算token数
+                        
+                        # 构建 message 对象
+                        message_obj = {
+                            "role": "assistant",
+                            "content": final_content,
+                            "reasoning_content": final_reasoning,
+                        }
+                        
+                        # 如果检测到 tool_calls，添加到 message
+                        finish_reason = "stop"
+                        if tool_calls_detected:
+                            message_obj["tool_calls"] = tool_calls_detected
+                            finish_reason = "tool_calls"
+                        
                         result = {
                             "id": completion_id,
                             "object": "chat.completion",
@@ -1246,12 +1430,8 @@ async def chat_completions(request: Request):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": final_content,
-                                        "reasoning_content": final_reasoning,
-                                    },
-                                    "finish_reason": "stop",
+                                    "message": message_obj,
+                                    "finish_reason": finish_reason,
                                 }
                             ],
                             "usage": {
