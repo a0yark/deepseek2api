@@ -2,13 +2,13 @@ import base64
 import ctypes
 import json
 import logging
+import os
 import queue
 import random
 import re
 import struct
 import threading
 import time
-import transformers
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from wasmtime import Linker, Module, Store
 
-# -------------------------- 初始化 tokenizer --------------------------
-chat_tokenizer_dir = "./"
-tokenizer = transformers.AutoTokenizer.from_pretrained(
-    chat_tokenizer_dir, trust_remote_code=True
-)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # -------------------------- 日志配置 --------------------------
 logging.basicConfig(
@@ -45,7 +41,8 @@ templates = Jinja2Templates(directory="templates")
 # ----------------------------------------------------------------------
 # (1) 配置文件的读写函数
 # ----------------------------------------------------------------------
-CONFIG_PATH = "config.json"
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+_CONFIG_LOCK = threading.RLock()
 
 
 def load_config():
@@ -59,36 +56,33 @@ def load_config():
 
 
 def save_config(cfg):
-    """将配置写回 config.json"""
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"[save_config] 写入 config.json 失败: {e}")
+    """原子写回 config.json（先写临时文件再 rename，避免半截写入）"""
+    with _CONFIG_LOCK:
+        try:
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception as e:
+            logger.error(f"[save_config] 写入 config.json 失败: {e}")
 
 
 CONFIG = load_config()
 
 # -------------------------- 全局账号队列 --------------------------
 account_queue = []  # 维护所有可用账号
-claude_api_key_queue = []  # 维护所有可用的Claude API keys
+_account_lock = threading.Lock()
 
 
 def init_account_queue():
     """初始化时从配置加载账号"""
     global account_queue
-    account_queue = CONFIG.get("accounts", [])[:]  # 深拷贝
-    random.shuffle(account_queue)  # 初始随机排序
-
-
-def init_claude_api_key_queue():
-    """Claude API keys由用户自己的token提供，这里初始化为空"""
-    global claude_api_key_queue
-    claude_api_key_queue = []
+    with _account_lock:
+        account_queue = list(CONFIG.get("accounts", []))
+        random.shuffle(account_queue)
 
 
 init_account_queue()
-init_claude_api_key_queue()
 
 # ----------------------------------------------------------------------
 # (2) DeepSeek 相关常量
@@ -100,16 +94,63 @@ DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_chall
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 DEEPSEEK_STOP_STREAM_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/stop_stream"
 DEEPSEEK_DELETE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/delete"
+
+# 与当前 chat.deepseek.com web 端 (2026-05) 一致的请求头
 BASE_HEADERS = {
     "Host": "chat.deepseek.com",
-    "User-Agent": "DeepSeek/1.0.13 Android/35",
-    "Accept": "application/json",
-    "Accept-Encoding": "gzip",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/147.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    # 不显式设 Accept-Encoding —— curl_cffi 的 impersonate 会按浏览器指纹设置,
+    # 同时避免在 stream 模式下出现库未支持的压缩(zstd 等)导致 utf-8 解码失败。
     "Content-Type": "application/json",
-    "x-client-platform": "android",
-    "x-client-version": "1.3.0-auto-resume",
+    "Origin": f"https://{DEEPSEEK_HOST}",
+    "Referer": f"https://{DEEPSEEK_HOST}/",
+    "x-app-version": "20241129.1",
+    "x-client-platform": "web",
+    "x-client-version": "2.0.0",
     "x-client-locale": "zh_CN",
-    "accept-charset": "UTF-8",
+    "x-client-timezone-offset": "28800",
+}
+
+# OpenAI 风格模型名 -> (model_type, thinking_enabled, search_enabled)
+MODEL_MAPPING = {
+    # 历史名 (V3 / R1 命名)
+    "deepseek-chat": ("default", False, False),
+    "deepseek-v3": ("default", False, False),
+    "deepseek-chat-search": ("default", False, True),
+    "deepseek-v3-search": ("default", False, True),
+    "deepseek-reasoner": ("expert", True, False),
+    "deepseek-r1": ("expert", True, False),
+    "deepseek-reasoner-search": ("expert", True, True),
+    "deepseek-r1-search": ("expert", True, True),
+    # V3.1 / V3.2 时代别名(网页端把 R1/V3 合并为同模型,以 think 开关切换)
+    "deepseek-v3.1": ("default", False, False),
+    "deepseek-v3.1-think": ("expert", True, False),
+    "deepseek-v3.1-search": ("default", False, True),
+    "deepseek-v3.2": ("default", False, False),
+    "deepseek-v3.2-think": ("expert", True, False),
+    "deepseek-v3.2-search": ("default", False, True),
+    # 直接按 model_type 命名
+    "deepseek-instant": ("default", False, False),
+    "deepseek-instant-search": ("default", False, True),
+    "deepseek-expert": ("expert", False, False),
+    "deepseek-expert-think": ("expert", True, False),
+    "deepseek-expert-search": ("expert", False, True),
+    "deepseek-expert-think-search": ("expert", True, True),
+    # V4 显式命名 (与 deepseek 官方 V4 模型对齐)
+    # deepseek-chat / deepseek-reasoner 在 2026-07-24 后即指向 v4-flash 的两种模式
+    "deepseek-v4-flash": ("default", False, False),
+    "deepseek-v4-flash-think": ("default", True, False),
+    "deepseek-v4-flash-search": ("default", False, True),
+    "deepseek-v4-flash-think-search": ("default", True, True),
+    "deepseek-v4-pro": ("expert", False, False),
+    "deepseek-v4-pro-think": ("expert", True, False),
+    "deepseek-v4-pro-search": ("expert", False, True),
+    "deepseek-v4-pro-think-search": ("expert", True, True),
 }
 
 # ----------------------------------------------------------------------
@@ -117,8 +158,15 @@ BASE_HEADERS = {
 # ----------------------------------------------------------------------
 CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Claude统一默认模型
 
-# WASM 模块文件路径
-WASM_PATH = "sha3_wasm_bg.7b9ca65ddd.wasm"
+# WASM 模块文件路径(绝对) + 常量缓存,避免每次重读
+WASM_PATH = os.path.join(BASE_DIR, "sha3_wasm_bg.7b9ca65ddd.wasm")
+
+try:
+    with open(WASM_PATH, "rb") as _f:
+        _WASM_BYTES = _f.read()
+except Exception as _e:
+    logger.warning(f"[init] 加载 wasm 失败: {_e}")
+    _WASM_BYTES = b""
 
 
 # ----------------------------------------------------------------------
@@ -189,8 +237,9 @@ def login_deepseek_via_account(account):
         raise HTTPException(
             status_code=500, detail="Account login failed: missing token"
         )
-    account["token"] = new_token
-    save_config(CONFIG)
+    with _CONFIG_LOCK:
+        account["token"] = new_token
+        save_config(CONFIG)
     return new_token
 
 
@@ -198,29 +247,41 @@ def login_deepseek_via_account(account):
 # (4) 从 accounts 中随机选择一个未忙且未尝试过的账号
 # ----------------------------------------------------------------------
 def choose_new_account(exclude_ids=None):
-    """选择策略：
-    1. 遍历队列，找到第一个未被 exclude_ids 包含的账号
-    2. 从队列中移除该账号
-    3. 返回该账号（由后续逻辑保证最终会重新入队）
-    """
+    """加锁地从队列中弹出一个未被排除的账号"""
     if exclude_ids is None:
         exclude_ids = []
-        
-    for i in range(len(account_queue)):
-        acc = account_queue[i]
-        acc_id = get_account_identifier(acc)
-        if acc_id and acc_id not in exclude_ids:
-            # 从队列中移除并返回
-            logger.info(f"[choose_new_account] 新选择账号: {acc_id}")
-            return account_queue.pop(i)
-
+    with _account_lock:
+        for i, acc in enumerate(account_queue):
+            acc_id = get_account_identifier(acc)
+            if acc_id and acc_id not in exclude_ids:
+                logger.info(f"[choose_new_account] 新选择账号: {acc_id}")
+                return account_queue.pop(i)
     logger.warning("[choose_new_account] 没有可用的账号或所有账号都在使用中")
     return None
 
 
 def release_account(account):
-    """将账号重新加入队列末尾"""
-    account_queue.append(account)
+    """将账号重新加入队列末尾(带去重,防止双重入队)"""
+    if account is None:
+        return
+    acc_id = get_account_identifier(account)
+    with _account_lock:
+        for existing in account_queue:
+            if get_account_identifier(existing) == acc_id:
+                return
+        account_queue.append(account)
+
+
+def release_account_once(request: Request):
+    """从 request.state 释放账号,且只释放一次,避免 stream 内外两层 finally 重复入队"""
+    if not getattr(request.state, "use_config_token", False):
+        return
+    if getattr(request.state, "account_released", False):
+        return
+    account = getattr(request.state, "account", None)
+    if account is not None:
+        release_account(account)
+    request.state.account_released = True
 
 
 # ----------------------------------------------------------------------
@@ -382,35 +443,23 @@ async def call_claude_via_openai(request: Request, claude_payload):
         model = deepseek_payload.get("model", "deepseek-chat")
         messages = deepseek_payload.get("messages", [])
         
-        # 判断模型特性
-        model_lower = model.lower()
-        if model_lower in ["deepseek-v3", "deepseek-chat"]:
-            thinking_enabled = False
-            search_enabled = False
-        elif model_lower in ["deepseek-r1", "deepseek-reasoner"]:
-            thinking_enabled = True
-            search_enabled = False
-        elif model_lower in ["deepseek-v3-search", "deepseek-chat-search"]:
-            thinking_enabled = False
-            search_enabled = True
-        elif model_lower in ["deepseek-r1-search", "deepseek-reasoner-search"]:
-            thinking_enabled = True
-            search_enabled = True
-        else:
-            thinking_enabled = False
-            search_enabled = False
-        
+        # 通过 MODEL_MAPPING 拿 (model_type, thinking_enabled, search_enabled),未命中则默认 default
+        mapping = MODEL_MAPPING.get(model.lower(), ("default", False, False))
+        model_type, thinking_enabled, search_enabled = mapping
+
         # 使用 messages_prepare 函数构造最终 prompt
         final_prompt = messages_prepare(messages)
-        
+
         headers = {**get_auth_headers(request), "x-ds-pow-response": pow_resp}
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
+            "model_type": model_type,
             "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "preempt": False,
         }
 
         deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
@@ -452,12 +501,17 @@ def call_completion_endpoint(payload, headers, max_attempts=3):
 # (7) 创建会话 & 获取 PoW（重试时，配置模式下错误会切换账号；用户自带 token 模式下仅重试）
 # ----------------------------------------------------------------------
 def create_session(request: Request, max_attempts=3):
+    """新版网页端 chat_session/create body 已改为 {} (空对象)。agent 字段被废弃。"""
     attempts = 0
     while attempts < max_attempts:
         headers = get_auth_headers(request)
         try:
             resp = requests.post(
-                DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={"agent": "chat"}, impersonate="safari15_3"
+                DEEPSEEK_CREATE_SESSION_URL,
+                headers=headers,
+                json={},
+                impersonate="safari15_3",
+                timeout=15,
             )
         except Exception as e:
             logger.error(f"[create_session] 请求异常: {e}")
@@ -471,10 +525,13 @@ def create_session(request: Request, max_attempts=3):
             logger.error(f"[create_session] JSON解析异常: {e}")
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
-            session_id = data["data"]["biz_data"]["id"]
-
+            biz = (data.get("data") or {}).get("biz_data") or {}
+            # 新版网页端: biz_data.chat_session.id ; 兼容旧的 biz_data.id
+            session_id = (biz.get("chat_session") or {}).get("id") or biz.get("id")
             resp.close()
-            return session_id
+            if session_id:
+                return session_id
+            logger.warning("[create_session] 响应中找不到 session id")
         else:
             code = data.get("code")
             logger.warning(
@@ -531,14 +588,16 @@ def compute_pow_answer(
     if algorithm != "DeepSeekHashV1":
         raise ValueError(f"不支持的算法：{algorithm}")
     prefix = f"{salt}_{expire_at}_"
-    # --- 加载 wasm 模块 ---
+    # --- 加载 wasm 模块 (使用全局缓存的 bytes) ---
     store = Store()
     linker = Linker(store.engine)
-    try:
-        with open(wasm_path, "rb") as f:
-            wasm_bytes = f.read()
-    except Exception as e:
-        raise RuntimeError(f"加载 wasm 文件失败: {wasm_path}, 错误: {e}")
+    wasm_bytes = _WASM_BYTES
+    if not wasm_bytes:
+        try:
+            with open(wasm_path, "rb") as f:
+                wasm_bytes = f.read()
+        except Exception as e:
+            raise RuntimeError(f"加载 wasm 文件失败: {wasm_path}, 错误: {e}")
     module = Module(store.engine, wasm_bytes)
     instance = linker.instantiate(store, module)
     exports = instance.exports(store)
@@ -696,38 +755,12 @@ def get_pow_response(request: Request, max_attempts=3):
 # ----------------------------------------------------------------------
 @app.get("/v1/models")
 def list_models():
+    created = 1677610602
     models_list = [
-        {
-            "id": "deepseek-chat",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-reasoner",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-chat-search",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-reasoner-search",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
+        {"id": name, "object": "model", "created": created, "owned_by": "deepseek", "permission": []}
+        for name in MODEL_MAPPING.keys()
     ]
-    data = {"object": "list", "data": models_list}
-    return JSONResponse(content=data, status_code=200)
+    return JSONResponse(content={"object": "list", "data": models_list}, status_code=200)
 
 
 # ----------------------------------------------------------------------
@@ -812,67 +845,234 @@ def messages_prepare(messages: list) -> str:
 KEEP_ALIVE_TIMEOUT = 5
 
 
+class FragmentSseParser:
+    """
+    新版网页接口 (chat.deepseek.com 2.0.0) 的 SSE 协议解析器。
+
+    协议要点:
+      * event: ready / update_session / title / close 是元事件,不带内容
+      * 第一个 data 帧含完整 response 结构,其中 fragments[0] 给出当前 fragment 元数据
+      * fragment.type == "THINK"  -> reasoning content
+        fragment.type == "RESPONSE" -> 正式回答
+      * 后续帧用 OT 风格更新:
+          {"p": "response/fragments/-1/content", "o": "APPEND", "v": "text"}
+          {"v": "text"}                    # 沿用上一帧的 path
+          {"p": "response/fragments/-1/elapsed_secs", "o": "SET", "v": 1.8}
+          {"p": "response/fragments", "o": "APPEND", "v": [{...new fragment...}]}
+          {"p": "response/status", "o": "SET", "v": "FINISHED"}
+
+    parse_line(raw_line) -> list[(kind, text)]   kind ∈ {"thinking", "text", "finish"}
+    """
+
+    def __init__(self):
+        self._current_kind = "text"
+        self._last_path = None
+        self._finished = False
+        self._search_citation_pat = re.compile(r"^\[citation:")
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def _classify_fragment(self, frag) -> str:
+        ftype = (frag or {}).get("type", "RESPONSE")
+        return "thinking" if ftype == "THINK" else "text"
+
+    def parse_line(self, raw_line):
+        events = []
+        if raw_line is None:
+            return events
+        try:
+            line = raw_line.decode("utf-8") if isinstance(raw_line, (bytes, bytearray)) else raw_line
+        except Exception:
+            return events
+        line = line.strip()
+        if not line or line.startswith("event:"):
+            return events
+        if not line.startswith("data:"):
+            return events
+        data_str = line[5:].strip()
+        if not data_str:
+            return events
+        if data_str == "[DONE]":
+            self._finished = True
+            events.append(("finish", ""))
+            return events
+        try:
+            chunk = json.loads(data_str)
+        except Exception:
+            return events
+
+        path = chunk.get("p")
+        op = chunk.get("o")
+        v = chunk.get("v")
+
+        # path 缺省时沿用上一次 path
+        if path is None:
+            path = self._last_path
+        else:
+            self._last_path = path
+
+        # 流终止
+        if path == "response/status" and v == "FINISHED":
+            self._finished = True
+            events.append(("finish", ""))
+            return events
+
+        # 完整 response 初始帧: {"v":{"response":{...,"fragments":[{...}]}}}
+        if isinstance(v, dict) and "response" in v:
+            frags = (v.get("response") or {}).get("fragments") or []
+            if frags:
+                self._current_kind = self._classify_fragment(frags[-1])
+                first_text = frags[-1].get("content") or ""
+                if first_text:
+                    events.append((self._current_kind, first_text))
+            return events
+
+        # 新增 fragment: {"p":"response/fragments","o":"APPEND","v":[{...}]}
+        if path == "response/fragments" and op == "APPEND":
+            frags = v if isinstance(v, list) else [v]
+            if frags:
+                self._current_kind = self._classify_fragment(frags[-1])
+                first_text = frags[-1].get("content") or ""
+                if first_text:
+                    events.append((self._current_kind, first_text))
+            return events
+
+        # 当前 fragment 内容追加
+        if path and path.startswith("response/fragments/") and path.endswith("/content"):
+            if isinstance(v, str):
+                if self._current_kind == "text" and self._search_citation_pat.match(v):
+                    return events
+                events.append((self._current_kind, v))
+            return events
+
+        # response 上的批量元数据更新(token 用量、quasi_status 等),不产生可见文本
+        if path == "response" and op == "BATCH":
+            if isinstance(v, list):
+                for item in v:
+                    if item.get("p") == "quasi_status" and item.get("v") == "FINISHED":
+                        # quasi_status 只是预完成信号,真正的 FINISHED 在 response/status
+                        pass
+            return events
+
+        # 兼容老协议: data:{"v": "text"} 但没 path -> 看作当前 kind 内容
+        if isinstance(v, str):
+            if self._current_kind == "text" and self._search_citation_pat.match(v):
+                return events
+            events.append((self._current_kind, v))
+        return events
+
+
 def detect_and_parse_tool_calls(content: str):
     """
-    检测并解析模型返回的 tool_calls JSON
-    返回: (tool_calls_list, remaining_content)
+    检测并解析模型返回的 tool 调用 JSON。
+    兼容下列输出形式 —— Claude Code 注入的 system prompt 会让模型输出多种风格,
+    都得能识别:
+
+      A) OpenAI-style:    {"tool_calls":[{"id","type":"function","function":{"name","arguments":"<json str>"}}]}
+      B) Anthropic-style: {"name":"X","input":{...}}            (单工具)
+      C) 旧版 ds-shim:     {"tool":"X","arguments":{...}}        (单工具)
+      D) Anthropic-array: [{"name":"X","input":{...}}, ...]      (多工具)
+      E) 上述任意被 ```json ... ``` 或 ``` ... ``` 包裹
+
+    返回: (tool_calls_list, remaining_content)  其中 tool_calls_list 是 OpenAI 标准形式。
     """
-    import re
-    
-    # 尝试匹配 JSON 格式的 tool_calls
-    # 支持多种格式：{"tool_calls": [...]} 或直接 [...] 数组
-    tool_calls = None
-    remaining_content = content
-    
-    # 模式1: {"tool_calls": [...]}
-    pattern1 = r'\{[\s\n]*"tool_calls"[\s\n]*:[\s\n]*\[(.*?)\][\s\n]*\}'
-    match1 = re.search(pattern1, content, re.DOTALL)
-    
-    if match1:
+    if not content:
+        return None, content
+
+    raw = content.strip()
+
+    # 去掉 ```json ... ``` / ``` ... ``` 包裹
+    fence = re.match(r"^```(?:json)?\s*([\s\S]+?)\s*```\s*$", raw)
+    if fence:
+        raw = fence.group(1).strip()
+
+    def _build(name, args, idx):
+        if isinstance(args, dict):
+            args_str = json.dumps(args, ensure_ascii=False)
+        elif isinstance(args, str):
+            args_str = args
+        else:
+            args_str = json.dumps(args, ensure_ascii=False)
+        return {
+            "id": f"call_{idx+1:03d}",
+            "type": "function",
+            "function": {"name": str(name), "arguments": args_str},
+        }
+
+    # ---- 1) 嵌入式 / 完整的 OpenAI {"tool_calls":[...]} ----
+    m = re.search(r'\{\s*"tool_calls"\s*:\s*\[[\s\S]*?\]\s*\}', raw)
+    if m:
         try:
-            # 提取完整的 JSON 对象
-            json_str = match1.group(0)
-            parsed = json.loads(json_str)
-            if "tool_calls" in parsed and isinstance(parsed["tool_calls"], list):
-                tool_calls = parsed["tool_calls"]
-                # 移除 tool_calls JSON，保留其他内容
-                remaining_content = content[:match1.start()] + content[match1.end():]
-                remaining_content = remaining_content.strip()
-        except json.JSONDecodeError:
+            parsed = json.loads(m.group(0))
+            calls = parsed.get("tool_calls") or []
+            valid = []
+            for i, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                func = call.get("function") if isinstance(call.get("function"), dict) else None
+                name = (func or {}).get("name") or call.get("name")
+                if not name:
+                    continue
+                args = (func or {}).get("arguments") if func else (call.get("input") or call.get("arguments"))
+                valid.append(_build(name, args if args is not None else {}, i))
+            if valid:
+                rem = (raw[: m.start()] + raw[m.end():]).strip()
+                return valid, rem
+        except Exception:
             pass
-    
-    # 如果找到了 tool_calls，验证格式并返回
-    if tool_calls:
-        # 确保每个 tool_call 有必需的字段
-        valid_calls = []
-        for i, call in enumerate(tool_calls):
-            if not isinstance(call, dict):
-                continue
-            
-            # 生成 call_id（如果没有）
-            call_id = call.get("id", f"call_{i+1:03d}")
-            call_type = call.get("type", "function")
-            
-            if "function" in call:
-                func = call["function"]
-                if isinstance(func, dict) and "name" in func:
-                    # 确保 arguments 是字符串
-                    args = func.get("arguments", "{}")
-                    if isinstance(args, dict):
-                        args = json.dumps(args, ensure_ascii=False)
-                    
-                    valid_calls.append({
-                        "id": call_id,
-                        "type": call_type,
-                        "function": {
-                            "name": func["name"],
-                            "arguments": args
-                        }
-                    })
-        
-        if valid_calls:
-            return valid_calls, remaining_content
-    
+
+    # ---- 2/3) 嵌入式扫描: 模型会先输出一段中文前言再输出 JSON,
+    # 用 raw_decode 从每个 '{'/'[' 起尝试增量解析,接受第一个能切出 tool 调用的对象/数组。
+    decoder = json.JSONDecoder()
+    n = len(raw)
+    for start in range(n):
+        ch = raw[start]
+        if ch not in "{[":
+            continue
+        try:
+            parsed, end = decoder.raw_decode(raw, start)
+        except json.JSONDecodeError:
+            continue
+
+        candidates = []
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("tool_calls"), list):
+                for i, call in enumerate(parsed["tool_calls"]):
+                    if not isinstance(call, dict):
+                        continue
+                    func = call.get("function") if isinstance(call.get("function"), dict) else None
+                    name = (func or {}).get("name") or call.get("name") or call.get("tool")
+                    if not name:
+                        continue
+                    args = (func or {}).get("arguments") if func else (
+                        call.get("input") if call.get("input") is not None else call.get("arguments")
+                    )
+                    candidates.append(_build(name, args if args is not None else {}, i))
+            else:
+                name = parsed.get("name") or parsed.get("tool")
+                args = parsed.get("input")
+                if args is None:
+                    args = parsed.get("arguments")
+                if name and (args is not None):
+                    candidates.append(_build(name, args, 0))
+        elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            for i, call in enumerate(parsed):
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name") or call.get("tool")
+                if not name:
+                    continue
+                args = call.get("input")
+                if args is None:
+                    args = call.get("arguments")
+                candidates.append(_build(name, args if args is not None else {}, i))
+
+        if candidates:
+            remaining = (raw[:start] + raw[end:]).strip()
+            return candidates, remaining
+
     return None, content
 
 
@@ -902,74 +1102,92 @@ async def chat_completions(request: Request):
             raise HTTPException(
                 status_code=400, detail="Request must include 'model' and 'messages'."
             )
-        # 判断是否启用"思考"或"搜索"功能（这里根据模型名称判断）
+        # 通过模型名查 (model_type, thinking_enabled, search_enabled)
         model_lower = model.lower()
-        if model_lower in ["deepseek-v3", "deepseek-chat"]:
-            thinking_enabled = False
-            search_enabled = False
-        elif model_lower in ["deepseek-r1", "deepseek-reasoner"]:
-            thinking_enabled = True
-            search_enabled = False
-        elif model_lower in ["deepseek-v3-search", "deepseek-chat-search"]:
-            thinking_enabled = False
-            search_enabled = True
-        elif model_lower in ["deepseek-r1-search", "deepseek-reasoner-search"]:
-            thinking_enabled = True
-            search_enabled = True
-        else:
+        mapping = MODEL_MAPPING.get(model_lower)
+        if mapping is None:
             raise HTTPException(
                 status_code=503, detail=f"Model '{model}' is not available."
             )
+        model_type, thinking_enabled, search_enabled = mapping
         
-        # 处理 tools 参数（OpenAI 格式）
+        # 处理 tools 参数 —— 兼容两种格式:
+        #   OpenAI:   {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+        #   Anthropic:{"name":"...","description":"...","input_schema":{...}}
         tools_requested = req_data.get("tools") or []
         has_tools = len(tools_requested) > 0
-        
-        # 如果有工具定义，在 messages 前添加工具使用指导的系统消息
+
+        def _normalize_tool(tool: dict) -> dict:
+            if isinstance(tool.get("function"), dict):
+                f = tool["function"]
+                return {
+                    "name": f.get("name", "unknown"),
+                    "description": f.get("description", ""),
+                    "schema": f.get("parameters") or {},
+                }
+            return {
+                "name": tool.get("name", "unknown"),
+                "description": tool.get("description", ""),
+                "schema": tool.get("input_schema") or tool.get("parameters") or {},
+            }
+
         if has_tools:
             tool_schemas = []
             for tool in tools_requested:
-                func = tool.get('function', {})
-                tool_name = func.get('name', 'unknown')
-                tool_desc = func.get('description', 'No description available')
-                params = func.get('parameters', {})
-                
-                tool_info = f"Tool: {tool_name}\nDescription: {tool_desc}"
-                if 'properties' in params:
+                norm = _normalize_tool(tool)
+                tool_info = f"Tool: {norm['name']}\nDescription: {norm['description'] or 'No description'}"
+                schema = norm["schema"]
+                if isinstance(schema, dict) and "properties" in schema:
                     props = []
-                    required = params.get('required', [])
-                    for prop_name, prop_info in params['properties'].items():
-                        prop_type = prop_info.get('type', 'string')
-                        prop_desc = prop_info.get('description', '')
-                        is_req = ' (required)' if prop_name in required else ''
+                    required = schema.get("required", []) or []
+                    for prop_name, prop_info in (schema.get("properties") or {}).items():
+                        if not isinstance(prop_info, dict):
+                            continue
+                        prop_type = prop_info.get("type", "string")
+                        prop_desc = prop_info.get("description", "")
+                        is_req = " (required)" if prop_name in required else ""
                         props.append(f"  - {prop_name}: {prop_type}{is_req} - {prop_desc}")
                     if props:
                         tool_info += f"\nParameters:\n{chr(10).join(props)}"
                 tool_schemas.append(tool_info)
-            
-            tool_system_prompt = f"""You have access to the following tools:
 
+            # 让模型严格输出 OpenAI 风格 tool_calls。把 sentinel 放显眼一点,
+            # 并禁止任何额外解释 —— 避免 Claude Code 注入的 system prompt 把模型导回
+            # Claude 原生 {"tool":...,"arguments":...} 风格。
+            tool_system_prompt = f"""You have access to these tools. To CALL a tool you MUST output ONLY a single JSON object that starts with `{{"tool_calls":` and nothing else — no prose, no markdown, no code fence.
+
+Available tools:
 {chr(10).join(tool_schemas)}
 
-When you need to use a tool, respond with a JSON object in this exact format:
-{{"tool_calls": [{{"id": "call_xxx", "type": "function", "function": {{"name": "tool_name", "arguments": "{{\\"param\\": \\"value\\"}}"}}}}]}}
+Required call format (OpenAI style):
+{{"tool_calls":[{{"id":"call_001","type":"function","function":{{"name":"<tool_name>","arguments":"<JSON-encoded string of arguments>"}}}}]}}
 
-You can call multiple tools in one response by adding more objects to the tool_calls array.
-IMPORTANT: The "arguments" field must be a JSON string, not a JSON object.
+Rules:
+1. Output ONLY the JSON object on its own — no surrounding text.
+2. The `arguments` field is a JSON STRING (escape inner quotes).
+3. Multiple parallel tools: put more entries in the `tool_calls` array.
+4. Do NOT use other formats like {{"tool":"X","arguments":{{}}}} or {{"name":"X","input":{{}}}}.
 
-Example:
-{{"tool_calls": [{{"id": "call_001", "type": "function", "function": {{"name": "get_weather", "arguments": "{{\\"location\\": \\"Beijing\\"}}"}}}}]}}
-
-After calling tools, you will receive the results and can continue the conversation."""
+After tools execute their results will come back as user messages and you can continue."""
             
             # 将工具说明添加到第一个 system 消息，或创建新的 system 消息
+            # Anthropic 协议下 content 可能是 [{"type":"text","text":"..."}, ...],
+            # 这里统一扁平化为 str 后再拼接,避免 list+str TypeError
+            def _flatten_content(c):
+                if isinstance(c, list):
+                    return "\n".join(
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                return str(c) if c is not None else ""
+
             system_found = False
             for msg in messages:
                 if msg.get("role") == "system":
-                    msg["content"] = msg["content"] + "\n\n" + tool_system_prompt
+                    msg["content"] = _flatten_content(msg.get("content")) + "\n\n" + tool_system_prompt
                     system_found = True
                     break
-            
+
             if not system_found:
                 messages.insert(0, {"role": "system", "content": tool_system_prompt})
         
@@ -988,10 +1206,12 @@ After calling tools, you will receive the results and can continue the conversat
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
+            "model_type": model_type,
             "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "preempt": False,
         }
 
         deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
@@ -1041,102 +1261,33 @@ After calling tools, you will receive the results and can continue the conversat
                             logger.warning(f"[sse_stream] 调用 delete_session 失败: {e}")
 
                     def process_data():
-                        ptype = "text"
+                        parser = FragmentSseParser()
                         try:
                             for raw_line in deepseek_resp.iter_lines():
-                                try:
-                                    line = raw_line.decode("utf-8")
-                                except Exception as e:
-                                    logger.warning(f"[sse_stream] 解码失败: {e}")
-                                    # 根据当前模式决定错误消息类型
-                                    error_type = "thinking" if ptype == "thinking" else "text"
-                                    busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解码失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
-                                    try:
-                                        busy_content = json.loads(busy_content_str)
-                                        result_queue.put(busy_content)
-                                    except json.JSONDecodeError:
-                                        # 如果JSON解析也失败，创建最基本的错误响应
-                                        result_queue.put({"choices": [{"index": 0, "delta": {"content": "解码失败", "type": "text"}}]})
-                                    result_queue.put(None)
-                                    break
-                                if not line:
+                                if raw_line is None:
                                     continue
-                                if line.startswith("data:"):
-                                    data_str = line[5:].strip()
-                                    if data_str == "[DONE]":
-                                        result_queue.put(None)  # 结束信号
-                                        break
-                                    try:
-                                        chunk = json.loads(data_str)
-                                        
-                                        if "response_message_id" in chunk:
-                                            response_message_id = chunk["response_message_id"]
-                                        
-                                        if "v" in chunk:
-                                            v_value = chunk["v"]
-                                            
-                                            # 构造新的 delta 格式的 chunk
-                                            content = ""
-
-                                            if "p" in chunk and chunk.get("p") == "response/status":
-                                                if v_value=='FINISHED':
-                                                    result_queue.put(None)  # 结束信号
-                                                    break
-                                                continue
-                                            
-                                            if "p" in chunk and chunk.get("p") == "response/search_status":
-                                                continue
-                                                
-                                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                                ptype = "thinking"
-                                            elif "p" in chunk and chunk.get("p") == "response/content":
-                                                ptype = "text"
-
-                                            # 处理文本内容
-                                            if isinstance(v_value, str):
-                                                content = v_value
-                                            # 处理数组更新如状态变更
-                                            elif isinstance(v_value, list):
-                                                for item in v_value:
-                                                    if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                        # 最终完成信号
-                                                        result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                                        result_queue.put(None)
-                                                        return
-                                                continue
-                                            
-                                            # 构造兼容原逻辑的 chunk
-                                            unified_chunk = {
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "content": content,
-                                                        "type": ptype
-                                                    }
-                                                }],
-                                                "model": "",
-                                                "chunk_token_usage": len(content) // 4,  # 简单估算token数
-                                                "created": 0,
-                                                "message_id": -1,
-                                                "parent_id": -1
-                                            }
-                    
-                                            result_queue.put(unified_chunk)
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"[sse_stream] 无法解析: {data_str}, 错误: {e}"
-                                        )
-                                        # 根据当前模式决定错误消息类型
-                                        error_type = "thinking" if ptype == "thinking" else "text"
-                                        busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解析失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
-                                        try:
-                                            busy_content = json.loads(busy_content_str)
-                                            result_queue.put(busy_content)
-                                        except json.JSONDecodeError:
-                                            # 如果JSON解析也失败，创建最基本的错误响应
-                                            result_queue.put({"choices": [{"index": 0, "delta": {"content": "解析失败", "type": "text"}}]})
+                                events = parser.parse_line(raw_line)
+                                for kind, text in events:
+                                    if kind == "finish":
                                         result_queue.put(None)
-                                        break
+                                        return
+                                    if not text:
+                                        continue
+                                    unified_chunk = {
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": text,
+                                                "type": kind,  # "thinking" | "text"
+                                            }
+                                        }],
+                                        "model": "",
+                                        "chunk_token_usage": len(text) // 4,
+                                        "created": 0,
+                                        "message_id": -1,
+                                        "parent_id": -1,
+                                    }
+                                    result_queue.put(unified_chunk)
                         except Exception as e:
                             logger.warning(f"[sse_stream] 错误: {e}")
                             # 创建基本的错误响应，不依赖JSON解析
@@ -1196,7 +1347,37 @@ After calling tools, you will receive the results and can continue the conversat
                                         }
                                         yield f"data: {json.dumps(tool_call_chunk, ensure_ascii=False)}\n\n"
                                         last_send_time = current_time
-                                
+                                elif has_tools:
+                                    # has_tools 模式下中间被 buffer 的文本: 流结束时一次性 emit,
+                                    # 含 thinking + 正式回答,以保持流式接口语义
+                                    if final_thinking:
+                                        yield (
+                                            "data: " + json.dumps({
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_time,
+                                                "model": model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {"role": "assistant", "reasoning_content": final_thinking},
+                                                }],
+                                            }, ensure_ascii=False) + "\n\n"
+                                        )
+                                    if final_text_content:
+                                        yield (
+                                            "data: " + json.dumps({
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_time,
+                                                "model": model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": ({"role": "assistant"} if not final_thinking else {}) | {"content": final_text_content},
+                                                }],
+                                            }, ensure_ascii=False) + "\n\n"
+                                        )
+                                    last_send_time = current_time
+
                                 # 发送最终统计信息
                                 prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                                 thinking_tokens = len(final_thinking) // 4  # 简单估算token数
@@ -1266,7 +1447,11 @@ After calling tools, you will receive the results and can continue the conversat
                                             "index": choice.get("index", 0),
                                         }
                                     )
-                            if new_choices:
+                            # has_tools 模式下,把模型输出 buffer 到流结束统一处理 ——
+                            # 因为模型会以 {"tool_calls":[...]} 文本形式输出工具调用,
+                            # 中间逐 chunk emit 会被下游(claude-code-router)当作普通 text_delta,
+                            # 导致 Anthropic 翻译层无法识别为 tool_use 块。
+                            if new_choices and not has_tools:
                                 out_chunk = {
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
@@ -1288,10 +1473,7 @@ After calling tools, you will receive the results and can continue the conversat
                     # 响应结束后删除会话
                     delete_deepseek_session()
                     
-                    if getattr(request.state, "use_config_token", False) and hasattr(
-                        request.state, "account"
-                    ):
-                        release_account(request.state.account)
+                    release_account_once(request)
 
             return StreamingResponse(
                 sse_stream(),
@@ -1330,175 +1512,76 @@ After calling tools, you will receive the results and can continue the conversat
 
             def collect_data():
                 nonlocal result
-                ptype = "text"
+                parser = FragmentSseParser()
+
+                def _build_result():
+                    final_reasoning = "".join(think_list)
+                    final_content = "".join(text_list)
+                    tool_calls_detected = None
+                    if has_tools:
+                        tool_calls_detected, _content = detect_and_parse_tool_calls(final_content)
+                        if tool_calls_detected:
+                            final_content = _content
+                    prompt_tokens = len(final_prompt) // 4
+                    reasoning_tokens = len(final_reasoning) // 4
+                    completion_tokens = len(final_content) // 4
+                    message_obj = {
+                        "role": "assistant",
+                        "content": final_content,
+                        "reasoning_content": final_reasoning,
+                    }
+                    finish_reason = "stop"
+                    if tool_calls_detected:
+                        message_obj["tool_calls"] = tool_calls_detected
+                        finish_reason = "tool_calls"
+                    return {
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": message_obj,
+                            "finish_reason": finish_reason,
+                        }],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": reasoning_tokens + completion_tokens,
+                            "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
+                            "completion_tokens_details": {
+                                "reasoning_tokens": reasoning_tokens,
+                            },
+                        },
+                    }
+
                 try:
                     for raw_line in deepseek_resp.iter_lines():
-                        try:
-                            line = raw_line.decode("utf-8")
-                        except Exception as e:
-                            logger.warning(f"[chat_completions] 解码失败: {e}")
-                            # 根据当前处理类型添加错误消息
-                            if ptype == "thinking":
-                                think_list.append('解码失败，请稍候再试')
-                            else:
-                                text_list.append('解码失败，请稍候再试')
-                            data_queue.put(None)
-                            break
-                        if not line:
+                        if raw_line is None:
                             continue
-                        if line.startswith("data:"):
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                data_queue.put(None)
+                        events = parser.parse_line(raw_line)
+                        finished = False
+                        for kind, text in events:
+                            if kind == "finish":
+                                finished = True
                                 break
-                            try:
-                                chunk = json.loads(data_str)
-            
-                                # 提取 v 字段
-                                if "v" in chunk:
-                                    v_value = chunk["v"]
-                                    
-                                    if "p" in chunk and chunk.get("p") == "response/status":
-                                        if v_value=='FINISHED':
-                                            data_queue.put(None)  # 结束信号
-                                            break
-                                        continue
-
-                                    if "p" in chunk and chunk.get("p") == "response/search_status":
-                                        continue
-                                                
-                                    if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                        ptype = "thinking"
-                                    elif "p" in chunk and chunk.get("p") == "response/content":
-                                        ptype = "text"
-            
-                                    # 处理字符串形式的 v 值（即文本内容）
-                                    if isinstance(v_value, str):
-                                        if search_enabled and v_value.startswith("[citation:"):
-                                            continue  # 跳过 citation 内容
-                                        if ptype == "thinking":
-                                            think_list.append(v_value)
-                                        else:
-                                            text_list.append(v_value)
-            
-                                    # 处理数组更新如状态变更
-                                    elif isinstance(v_value, list):
-                                        for item in v_value:
-                                            if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                # 构建最终结果
-                                                final_reasoning = "".join(think_list)
-                                                final_content = "".join(text_list)
-                                                
-                                                # 检测 tool_calls
-                                                tool_calls_detected = None
-                                                if has_tools:
-                                                    tool_calls_detected, final_content = detect_and_parse_tool_calls(final_content)
-                                                
-                                                prompt_tokens = len(final_prompt) // 4  # 简单估算token数
-                                                reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
-                                                completion_tokens = len(final_content) // 4  # 简单估算token数
-                                                
-                                                # 构建 message 对象
-                                                message_obj = {
-                                                    "role": "assistant",
-                                                    "content": final_content,
-                                                    "reasoning_content": final_reasoning,
-                                                }
-                                                
-                                                # 如果检测到 tool_calls，添加到 message
-                                                finish_reason = "stop"
-                                                if tool_calls_detected:
-                                                    message_obj["tool_calls"] = tool_calls_detected
-                                                    finish_reason = "tool_calls"
-                                                
-                                                result = {
-                                                    "id": completion_id,
-                                                    "object": "chat.completion",
-                                                    "created": created_time,
-                                                    "model": model,
-                                                    "choices": [
-                                                        {
-                                                            "index": 0,
-                                                            "message": message_obj,
-                                                            "finish_reason": finish_reason,
-                                                        }
-                                                    ],
-                                                    "usage": {
-                                                        "prompt_tokens": prompt_tokens,
-                                                        "completion_tokens": reasoning_tokens + completion_tokens,
-                                                        "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                                                        "completion_tokens_details": {
-                                                            "reasoning_tokens": reasoning_tokens
-                                                        },
-                                                    },
-                                                }
-                                                data_queue.put("DONE")
-                                                return  # 提前返回，结束函数
-            
-                            except Exception as e:
-                                logger.warning(f"[collect_data] 无法解析: {data_str}, 错误: {e}")
-                                # 根据当前处理类型添加错误消息
-                                if ptype == "thinking":
-                                    think_list.append('解析失败，请稍候再试')
-                                else:
-                                    text_list.append('解析失败，请稍候再试')
-                                data_queue.put(None)
-                                break
+                            if not text:
+                                continue
+                            if kind == "thinking":
+                                think_list.append(text)
+                            else:
+                                text_list.append(text)
+                        if finished:
+                            result = _build_result()
+                            data_queue.put("DONE")
+                            return
                 except Exception as e:
                     logger.warning(f"[collect_data] 错误: {e}")
-                    # 根据当前处理类型添加错误消息
-                    if ptype == "thinking":
-                        think_list.append('处理失败，请稍候再试')
-                    else:
-                        text_list.append('处理失败，请稍候再试')
+                    text_list.append('处理失败，请稍候再试')
                     data_queue.put(None)
                 finally:
                     deepseek_resp.close()
                     if result is None:
-                        # 如果没有提前构造 result，则构造默认结果
-                        final_content = "".join(text_list)
-                        final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
-                        
-                        # 检测 tool_calls
-                        tool_calls_detected = None
-                        if has_tools:
-                            tool_calls_detected, final_content = detect_and_parse_tool_calls(final_content)
-                        
-                        prompt_tokens = len(final_prompt) // 4  # 简单估算token数
-                        reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
-                        completion_tokens = len(final_content) // 4  # 简单估算token数
-                        
-                        # 构建 message 对象
-                        message_obj = {
-                            "role": "assistant",
-                            "content": final_content,
-                            "reasoning_content": final_reasoning,
-                        }
-                        
-                        # 如果检测到 tool_calls，添加到 message
-                        finish_reason = "stop"
-                        if tool_calls_detected:
-                            message_obj["tool_calls"] = tool_calls_detected
-                            finish_reason = "tool_calls"
-                        
-                        result = {
-                            "id": completion_id,
-                            "object": "chat.completion",
-                            "created": created_time,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "message": message_obj,
-                                    "finish_reason": finish_reason,
-                                }
-                            ],
-                            "usage": {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": reasoning_tokens + completion_tokens,
-                                "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                            },
-                        }
+                        result = _build_result()
                     data_queue.put("DONE")
 
             collect_thread = threading.Thread(target=collect_data)
@@ -1525,13 +1608,10 @@ After calling tools, you will receive the results and can continue the conversat
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
     except Exception as exc:
-        logger.error(f"[chat_completions] 未知异常: {exc}")
+        logger.error(f"[chat_completions] 未知异常: {exc}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
     finally:
-        if getattr(request.state, "use_config_token", False) and hasattr(
-            request.state, "account"
-        ):
-            release_account(request.state.account)
+        release_account_once(request)
 
 
 # ----------------------------------------------------------------------
@@ -1682,33 +1762,20 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                     full_response_text = ""
                     response_completed = False
                     
-                    # 解析DeepSeek流式响应
+                    # 解析DeepSeek流式响应(新 fragments 协议)
+                    parser = FragmentSseParser()
                     for line in deepseek_resp.iter_lines():
                         if not line:
                             continue
-                        try:
-                            line_str = line.decode('utf-8')
-                        except Exception:
-                            continue
-                            
-                        if line_str.startswith('data:'):
-                            data_str = line_str[5:].strip()
-                            if data_str == '[DONE]':
+                        for kind, text in parser.parse_line(line):
+                            if kind == "finish":
                                 response_completed = True
                                 break
-                                
-                            try:
-                                chunk = json.loads(data_str)
-                                if "v" in chunk and isinstance(chunk["v"], str):
-                                    full_response_text += chunk["v"]
-                                elif "v" in chunk and isinstance(chunk["v"], list):
-                                    # 检查完成状态
-                                    for item in chunk["v"]:
-                                        if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                            response_completed = True
-                                            break
-                            except (json.JSONDecodeError, KeyError):
-                                continue
+                            if kind == "text" and text:
+                                full_response_text += text
+                        if parser.finished:
+                            response_completed = True
+                            break
                     
                     # 现在一次性发送Claude格式的事件
                     
@@ -1848,10 +1915,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                     except Exception:
                         pass
                     # 释放账号资源 
-                    if getattr(request.state, "use_config_token", False) and hasattr(
-                        request.state, "account"
-                    ):
-                        release_account(request.state.account)
+                    release_account_once(request)
 
             return StreamingResponse(
                 claude_sse_stream(),
@@ -1863,61 +1927,22 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
             try:
                 final_content = ""
                 final_reasoning = ""
-                
+                parser = FragmentSseParser()
                 for line in deepseek_resp.iter_lines():
                     if not line:
                         continue
-                    
-                    try:
-                        line_str = line.decode('utf-8')
-                    except Exception as e:
-                        logger.warning(f"[claude_messages] 行解码失败: {e}")
-                        continue
-                        
-                    if line_str.startswith('data:'):
-                        data_str = line_str[5:].strip()
-                        if data_str == '[DONE]':
+                    for kind, text in parser.parse_line(line):
+                        if kind == "finish":
                             break
-                        
-                        try:
-                            chunk = json.loads(data_str)
-                            
-                            # 使用DeepSeek的响应格式解析 - 提取 v 字段
-                            if "v" in chunk:
-                                v_value = chunk["v"]
-                                
-                                # 跳过搜索状态
-                                if "p" in chunk and chunk.get("p") == "response/search_status":
-                                    continue
-                                    
-                                # 判断内容类型
-                                ptype = "text"
-                                if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                    ptype = "thinking"
-                                elif "p" in chunk and chunk.get("p") == "response/content":
-                                    ptype = "text"
-                                
-                                # 处理字符串形式的 v 值（即文本内容）
-                                if isinstance(v_value, str):
-                                    if ptype == "thinking":
-                                        final_reasoning += v_value
-                                    else:
-                                        final_content += v_value
-                                        
-                                # 处理数组更新如状态变更
-                                elif isinstance(v_value, list):
-                                    for item in v_value:
-                                        if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                            # 完成标志
-                                            break
-                                            
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"[claude_messages] JSON解析失败: {e}, data: {data_str}")
+                        if not text:
                             continue
-                        except Exception as e:
-                            logger.warning(f"[claude_messages] chunk处理失败: {e}")
-                            continue
-                
+                        if kind == "thinking":
+                            final_reasoning += text
+                        else:
+                            final_content += text
+                    if parser.finished:
+                        break
+
                 try:
                     deepseek_resp.close()
                 except Exception as e:
@@ -2058,10 +2083,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
         return JSONResponse(status_code=500, content={"error": {"type": "api_error", "message": "Internal Server Error"}})
     finally:
         # 释放账号资源
-        if getattr(request.state, "use_config_token", False) and hasattr(
-            request.state, "account"
-        ):
-            release_account(request.state.account)
+        release_account_once(request)
 
 
 # ----------------------------------------------------------------------
