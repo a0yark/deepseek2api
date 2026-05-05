@@ -1,12 +1,22 @@
 # DeepSeek2API
 
-[![](https://img.shields.io/github/license/iidamie/deepseek2api.svg)](LICENSE)
-![](https://img.shields.io/github/stars/iidamie/deepseek2api.svg)
-![](https://img.shields.io/github/forks/iidamie/deepseek2api.svg)
+[![](https://img.shields.io/github/license/a0yark/deepseek2api.svg)](LICENSE)
+![](https://img.shields.io/github/stars/a0yark/deepseek2api.svg)
+![](https://img.shields.io/github/forks/a0yark/deepseek2api.svg)
 
-支持高速流式输出、支持多轮对话、支持R1深度思考，多路账号支持，支持对话结束后自动删除 DeepSeek 会话，支持 工具函数调用。
+支持高速流式输出、支持多轮对话、支持深度思考(reasoning)，多路账号支持，支持对话结束后自动删除 DeepSeek 会话，支持工具函数调用。
 
-与ChatGPT接口完全兼容。
+与 ChatGPT 接口完全兼容。
+
+> **本仓库是 [iidamie/deepseek2api](https://github.com/iidamie/deepseek2api) 的 fork。** 上游已 archive,但 DeepSeek 网页端在 2026-04 升级到 V4 协议后原实现失效,本 fork 基于实测抓包重写关键路径并增加 [claude-code-router](https://github.com/musistudio/claude-code-router) 适配,可直接用于 Claude Code。详见 [v1.4.0 commit](https://github.com/a0yark/deepseek2api/commit/c6808ff)。
+
+## v1.4.0 更新摘要
+
+* **DeepSeek V4 网页端协议**:升级 BASE_HEADERS、`chat_session/create` 空 body、`completion` 新增 `model_type` / `preempt`、SSE 改 fragments OT 协议
+* **新模型命名**:`deepseek-v4-flash` (Instant) / `deepseek-v4-pro` (Expert),含 `-think` / `-search` 变体;旧 `deepseek-chat` / `deepseek-reasoner` 别名保留
+* **Claude / Anthropic 工具兼容**:接受 Anthropic 风格 `tools` 数组、扁平化 `system` content、流式工具调用 buffer + emit;detector 同时识别 OpenAI / Anthropic / 单对象 / 数组 / markdown 包裹的 5 种格式
+* **依赖瘦身**:删除未实际使用的 `transformers` (镜像减重 ~1GB)
+* **稳定性**:WASM bytes 缓存、账号队列与 config 写入加锁、防双重 release
 
 ## 目录
 
@@ -17,6 +27,7 @@
 * [Docker-compose部署](#Docker-compose部署)
 * [Vercel部署](#Vercel部署)
 * [原生部署](#原生部署)
+* [接入 Claude Code](#接入-claude-code)
 * [接口列表](#接口列表)
   * [模型列表](#模型列表)
   * [对话补全](#对话补全)
@@ -197,6 +208,59 @@ python app.py
 nohup uvicorn app:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
 ```
 
+## 接入 Claude Code
+
+通过 [claude-code-router](https://github.com/musistudio/claude-code-router) 把本服务包成 Anthropic 兼容端点,Claude Code 可直接使用,**支持 MCP 工具调用与 Skill** (实测多步工具循环可用,但 DeepSeek 模型一次只 emit 一个 tool_call,并行多工具会被串行化,不是协议层问题)。
+
+1. 启动本服务(`python app.py`,默认 `http://127.0.0.1:5001`)
+
+2. 安装 ccr:
+   ```shell
+   npm install -g @musistudio/claude-code-router
+   ```
+
+3. 编辑 `~/.claude-code-router/config.json`,加一个指向本服务的 OpenAI 兼容 provider:
+   ```json
+   {
+     "Providers": [
+       {
+         "name": "deepseek",
+         "api_base_url": "http://127.0.0.1:5001/v1/chat/completions",
+         "api_key": "<你的 deepseek 网页 token,或 config.json keys 中的一个>",
+         "models": [
+           "deepseek-v4-flash",
+           "deepseek-v4-pro",
+           "deepseek-v4-pro-think",
+           "deepseek-v4-pro-think-search",
+           "deepseek-v4-flash-search"
+         ]
+       }
+     ],
+     "Router": {
+       "default":     "deepseek,deepseek-v4-flash",
+       "background":  "deepseek,deepseek-v4-flash",
+       "think":       "deepseek,deepseek-v4-pro-think",
+       "longContext": "deepseek,deepseek-v4-flash",
+       "longContextThreshold": 60000,
+       "webSearch":   "deepseek,deepseek-v4-flash-search"
+     }
+   }
+   ```
+   `api_key` 字段:如果填的是本仓库 `config.json` `keys` 里的值,服务会用账号池里的某个账号 token;否则它直接被当作 deepseek 网页 token 发给 chat.deepseek.com。
+
+4. 启动并使用:
+   ```shell
+   ccr restart
+   ccr code
+   ```
+
+实测限制(请按预期使用):
+
+* 并行多工具调用会被 DeepSeek 模型串行化
+* `prompt_caching` 未实现,长会话每轮全量重发
+* Expert 模式输入上限约 163,840 字符,超长 `system` + 大量工具 schema 时切到 `deepseek-v4-flash` (上限约 2,621,440 字符)
+* 图片输入未支持
+
 ## 接口列表
 
 目前支持与openai兼容的 `/v1/chat/completions` 接口，可自行使用与openai或其他兼容的客户端接入接口。
@@ -207,42 +271,20 @@ nohup uvicorn app:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
 
 **GET /v1/models**
 
-响应数据:
-```json
-{
-  "data": [
-    {
-      "created": 1677610602,
-      "id": "deepseek-chat",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    },
-    {
-      "created": 1677610602,
-      "id": "deepseek-reasoner",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    },
-    {
-      "created": 1677610602,
-      "id": "deepseek-chat-search",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    },
-    {
-      "created": 1677610602,
-      "id": "deepseek-reasoner-search",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    }
-  ],
-  "object": "list"
-}
-```
+支持的 model 名(全部映射到 DeepSeek 网页端的 `model_type` + `thinking_enabled` + `search_enabled` 三元组):
+
+| model 名 | DeepSeek 内部档位 | think | search |
+|---|---|---|---|
+| `deepseek-v4-flash` / `deepseek-chat` / `deepseek-v3` / `deepseek-v3.1` / `deepseek-v3.2` / `deepseek-instant` | default (Instant) | ✗ | ✗ |
+| `deepseek-v4-flash-search` / `deepseek-chat-search` / `deepseek-instant-search` / `deepseek-v3-search` | default | ✗ | ✓ |
+| `deepseek-v4-flash-think` | default | ✓ | ✗ |
+| `deepseek-v4-flash-think-search` | default | ✓ | ✓ |
+| `deepseek-v4-pro` / `deepseek-expert` | expert (Expert) | ✗ | ✗ |
+| `deepseek-v4-pro-think` / `deepseek-reasoner` / `deepseek-r1` / `deepseek-v3.1-think` / `deepseek-v3.2-think` / `deepseek-expert-think` | expert | ✓ | ✗ |
+| `deepseek-v4-pro-search` / `deepseek-expert-search` | expert | ✗ | ✓ |
+| `deepseek-v4-pro-think-search` / `deepseek-reasoner-search` / `deepseek-r1-search` / `deepseek-expert-think-search` | expert | ✓ | ✓ |
+
+> Instant 输入字符上限 ~2,621,440;Expert ~163,840(实测,以 chat.deepseek.com 当时的 settings 为准)。
 
 ### 对话补全
 
@@ -256,23 +298,23 @@ header 需要设置 Authorization 头部：
 Authorization: Bearer [userToken value or keys]
 ```
 
-请求数据：
+请求数据:
 ```json
 {
-    // model名称
-    // 默认：deepseek-chat 或 deepseek-v3
-    // 深度思考：deepseek-reasoner 或 deepseek-r1
-    // 联网搜索：deepseek-chat-search 或 deepseek-v3-search
-    // 联网搜索 + 深度思考：deepseek-reasoner-search 或 deepseek-r1-search
-    "model": "deepseek-chat",
-    // 多轮对话基于消息合并实现，某些场景可能导致能力下降且受单轮最大token数限制
+    // model 名称(参考上方表格,推荐使用 V4 命名)
+    // 默认:           deepseek-v4-flash
+    // 深度思考:        deepseek-v4-pro-think
+    // 联网搜索:        deepseek-v4-flash-search
+    // 联网搜索+深度思考: deepseek-v4-pro-think-search
+    "model": "deepseek-v4-flash",
+    // 多轮对话基于消息合并实现,某些场景可能导致能力下降且受单轮最大 token 数限制
     "messages": [
         {
             "role": "user",
             "content": "你是谁？"
         }
     ],
-    // 如果使用流式响应请设置为true，默认false
+    // 如果使用流式响应请设置为 true,默认 false
     "stream": false
 }
 ```
@@ -337,8 +379,10 @@ keepalive_timeout 120;
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=iidamie/deepseek2api&type=Date)](https://star-history.com/#iidamie/deepseek2api&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=a0yark/deepseek2api&type=Date)](https://star-history.com/#a0yark/deepseek2api&Date)
 
 ## 鸣谢
 
-本项目部分代码参考了 [LLM-Red-Team/deepseek-free-api](https://github.com/LLM-Red-Team/deepseek-free-api)，在此表示感谢
+* 上游原仓库 [iidamie/deepseek2api](https://github.com/iidamie/deepseek2api) — 本仓库 fork 自此并基于实测重写 V4 适配
+* [LLM-Red-Team/deepseek-free-api](https://github.com/LLM-Red-Team/deepseek-free-api) — 上游参考的部分实现
+* [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) — 用于把本服务暴露成 Anthropic 兼容端点
